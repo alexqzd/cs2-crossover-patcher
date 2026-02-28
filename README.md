@@ -1,83 +1,95 @@
-# Cities Skylines 2 — CrossOver DLL Patcher
+# Cities Skylines 2 — CrossOver Fix (macOS)
 
-Patches `Colossal.IO.dll` from any version of Cities Skylines 2 to fix the crash that prevents the game from launching under Wine/CrossOver on macOS.
+Fixes the crash that prevents Cities Skylines 2 from launching under CrossOver on macOS.
 
-## What it fixes
-
-Wine returns unexpected error codes from `FindNextFile`, which triggers an `IOException` inside `LongDirectory.EnumerateFileSystemIterator` and `LongDirectory.EnumerateFileSystemIteratorRecursive`. The game crashes at startup before reaching the main menu.
-
-The patcher removes the Win32 error-check block in both iterator state machines, so Wine's bogus error codes are silently ignored instead of crashing the game.
-
-Confirmed working on:
-- Cities Skylines 2 v1.5.5f1 / CrossOver 26 / macOS 26 (Apple Silicon)
-
-## Quick install (pre-patched DLL)
-
-If your game version matches one of the pre-patched DLLs in the `prepatched/` folder, you can skip the patcher and drop the file in directly.
-
-**Check your game version** in `Player.log` (line starting with `Game version:`):
-```
-~/Library/Logs/Cities Skylines II/Player.log        # native
-AppData/LocalLow/Colossal Order/Cities Skylines II/Player.log  # CrossOver
-```
-
-| Version | File |
-|---------|------|
-| v1.5.5f1 | `prepatched/v1.5.5f1/Colossal.IO.dll` |
-
-**Where to copy it:**
-```
-<bottle>/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed/Colossal.IO.dll
-```
-
-Back up the original first:
-```bash
-cp Colossal.IO.dll Colossal.IO.dll.bak
-```
-
-If your version isn't listed, use the patcher below to generate one from your own DLL.
+Confirmed working on **v1.5.5f1 / CrossOver 26 / macOS 26 (Apple Silicon)**.
 
 ---
 
-## Requirements
+## Quick Fix — Just copy a file
 
-- [.NET SDK](https://dotnet.microsoft.com/download) (`brew install --cask dotnet-sdk`)
+**1. Find your game version**
 
-## Usage
+Open this file in a text editor and look for the line that starts with `Game version:`:
+```
+/Users/<you>/Library/Application Support/CrossOver/Bottles/Steam/drive_c/users/crossover/AppData/LocalLow/Colossal Order/Cities Skylines II/Player.log
+```
+
+**2. Download the patched DLL**
+
+Go to the [Releases](../../releases) page and download the zip for your game version. It contains a single file: `Colossal.IO.dll`.
+
+**3. Back up and replace**
+
+Navigate to:
+```
+<CrossOver Bottle>/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed/
+```
+
+- Rename the existing `Colossal.IO.dll` to `Colossal.IO.dll.bak`
+- Copy the downloaded `Colossal.IO.dll` into that folder
+
+**4. Two more things before launching**
+
+Remove invisible files macOS creates in the game folder (open Terminal and paste this, replacing the path with yours):
+```bash
+find "/Volumes/<Drive>/CrossOver Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II" -name '.DS_Store' -type f -delete
+```
+
+Create marker files in your save data folder:
+```bash
+find "/Volumes/<Drive>/CrossOver Bottles/Steam/drive_c/users/crossover/AppData/LocalLow/Colossal Order/Cities Skylines II" -type d -exec touch {}/.priority \;
+```
+
+**5. Launch the game** — it should work now.
+
+> **Note:** If Steam updates the game or you use "Verify Files", you'll need to redo step 3. Steps 4 are one-time only.
+
+> **Mods:** Paradox Mods in-game is broken for CrossOver users. You can still install mods manually from [paradoxmods.net](https://mods.paradoxplaza.com/games/cities_skylines_2).
+
+---
+
+## My version isn't listed — Patcher tool
+
+If there's no pre-built DLL for your game version, you can patch your own in a few commands.
+
+**Requirements:** [.NET SDK](https://dotnet.microsoft.com/download) (`brew install --cask dotnet-sdk`)
 
 ```bash
-# Dry run — inspect what will be patched without modifying anything
-dotnet run -- "/path/to/bottle/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed/Colossal.IO.dll"
+# Clone this repo
+git clone https://github.com/alexqzd/cs2-crossover-patcher
+cd cs2-crossover-patcher
+
+# Dry run first — shows what it will change without touching anything
+dotnet run -- "/Volumes/<Drive>/CrossOver Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed/Colossal.IO.dll"
 
 # Apply the patch
-dotnet run -- "/path/to/bottle/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed/Colossal.IO.dll" --patch
+dotnet run -- "/Volumes/<Drive>/CrossOver Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed/Colossal.IO.dll" --patch
 ```
 
-For a default CrossOver Steam bottle on an external drive, the path is typically:
+The patcher matches by IL pattern (not hardcoded byte offsets), so it works across game versions.
 
-```bash
-dotnet run -- "/Volumes/<DriveName>/CrossOver Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed/Colossal.IO.dll" --patch
+---
+
+## Technical details
+
+Wine returns unexpected error codes from the Win32 `FindNextFile` API. Inside `Colossal.IO.dll`, the `LongDirectory` class uses a custom filesystem iterator that checks this error code and throws an `IOException` for anything other than `ERROR_NO_MORE_FILES` (18). Under Wine, valid calls randomly return other codes, crashing the game at startup before the main menu.
+
+The fix removes the error-check block in both iterator state machines (`EnumerateFileSystemIterator` and `EnumerateFileSystemIteratorRecursive`), so unexpected error codes are silently ignored and the iterator simply stops — which is the correct behavior.
+
+Specifically, in each `MoveNext()` method, the following IL block is replaced with NOPs:
+
+```
+call  Marshal::GetLastWin32Error()
+stloc errorCode
+ldloc errorCode
+ldc.i4.s 18                         // ERROR_NO_MORE_FILES
+beq.s [cleanup]                     // skip throw if normal end
+ldloc errorCode
+ldnull
+ldstr "path"
+call  Helper::GetExceptionFromWin32Error(...)
+throw                               // ← this is what crashes under Wine
 ```
 
-## Re-patching after game updates
-
-Steam updates or "Verify files" will overwrite `Colossal.IO.dll`. Just run the patch command above again — the patcher matches by IL pattern, not hardcoded byte offsets, so it works across game versions.
-
-## Other required steps
-
-The DLL patch alone may not be enough. You also need:
-
-1. **Remove `.DS_Store` files** from the game folder (Finder creates these silently):
-   ```bash
-   find "/path/to/Cities Skylines II" -name '.DS_Store' -type f -delete
-   ```
-
-2. **`.priority` files** in every subfolder of your user data directory:
-   ```bash
-   find "/path/to/bottle/drive_c/users/crossover/AppData/LocalLow/Colossal Order/Cities Skylines II" -type d -exec touch {}/.priority \;
-   ```
-
-## Notes
-
-- Mods via Paradox Mods are still broken (different DLL, `PDX.SDK.dll`). Install mods manually via [Paradox Mods](https://mods.paradoxplaza.com/games/cities_skylines_2) if needed.
-- Original research and fix by [presidenzo](https://www.reddit.com/r/CitiesSkylines2/comments/1j06llw/cs2_macoswhisky_123f1/).
+Original research and fix: [presidenzo on r/CitiesSkylines2](https://www.reddit.com/r/CitiesSkylines2/comments/1j06llw/cs2_macoswhisky_123f1/).
