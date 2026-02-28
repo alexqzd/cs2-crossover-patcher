@@ -11,6 +11,34 @@ The patcher removes the Win32 error-check block in both iterator state machines,
 Confirmed working on:
 - Cities Skylines 2 v1.5.5f1 / CrossOver 26 / macOS 26 (Apple Silicon)
 
+## Quick install (pre-patched DLL)
+
+If your game version matches one of the pre-patched DLLs in the `prepatched/` folder, you can skip the patcher and drop the file in directly.
+
+**Check your game version** in `Player.log` (line starting with `Game version:`):
+```
+~/Library/Logs/Cities Skylines II/Player.log        # native
+AppData/LocalLow/Colossal Order/Cities Skylines II/Player.log  # CrossOver
+```
+
+| Version | File |
+|---------|------|
+| v1.5.5f1 | `prepatched/v1.5.5f1/Colossal.IO.dll` |
+
+**Where to copy it:**
+```
+<bottle>/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed/Colossal.IO.dll
+```
+
+Back up the original first:
+```bash
+cp Colossal.IO.dll Colossal.IO.dll.bak
+```
+
+If your version isn't listed, use the patcher below to generate one from your own DLL.
+
+---
+
 ## Requirements
 
 - [.NET SDK](https://dotnet.microsoft.com/download) (`brew install --cask dotnet-sdk`)
