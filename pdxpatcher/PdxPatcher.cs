@@ -5,7 +5,15 @@ using System.IO;
 using System.Linq;
 
 var dllPath = args.Length > 0 ? args[0] : null;
-if (dllPath == null) { Console.WriteLine("Usage: pdxpatcher <PDX.SDK.dll> [--patch]"); return 1; }
+if (dllPath == null) { Console.WriteLine("Usage: pdxpatcher <PDX.SDK.dll|Managed_dir> [--patch]"); return 1; }
+
+// If given a directory, look for PDX.SDK.dll inside it
+if (Directory.Exists(dllPath))
+{
+    var candidate = Path.Combine(dllPath, "PDX.SDK.dll");
+    if (File.Exists(candidate)) dllPath = candidate;
+    else { Console.WriteLine($"ERROR: PDX.SDK.dll not found in {dllPath}"); return 1; }
+}
 
 bool dryRun = args.Length < 2 || args[1] != "--patch";
 Console.WriteLine($"Mode: {(dryRun ? "DRY RUN" : "PATCHING")}\nLoading: {dllPath}\n");
@@ -660,22 +668,109 @@ Console.WriteLine();
 
 if (dryRun)
 {
-    Console.WriteLine($"Dry run complete. {totalPatched} fix(es) identified.");
-    Console.WriteLine("Run with --patch to apply.");
+    Console.WriteLine($"PDX.SDK: Dry run complete. {totalPatched} fix(es) identified.");
+}
+else if (totalPatched > 0)
+{
+    var tempPath = dllPath + ".tmp";
+    module.Write(tempPath);
+    module.Dispose();
+    File.Move(tempPath, dllPath, overwrite: true);
+    Console.WriteLine($"\nSaved patched PDX.SDK.dll ({totalPatched} fixes)");
 }
 else
 {
-    if (totalPatched > 0)
-    {
-        var tempPath = dllPath + ".tmp";
-        module.Write(tempPath);
-        module.Dispose();
-        File.Move(tempPath, dllPath, overwrite: true);
-        Console.WriteLine($"\nSaved patched DLL to {dllPath}");
-        return 0;
-    }
-    else Console.WriteLine("Nothing to patch.");
+    Console.WriteLine("PDX.SDK: Nothing to patch.");
+    module.Dispose();
 }
 
-module.Dispose();
+// ---- FIX 15: Colossal.IO.AssetDatabase.dll .priority File.Exists bypass ----
+// Wine's GetFileAttributesW returns TRUE for non-existent files when parent dir exists.
+// PopulateFromDirectory calls File.Exists(".priority") → true → File.ReadAllLines → FileNotFoundException
+// Fix: NOP the File.Exists check, unconditional branch to skip .priority reading entirely.
+var managedDir = Path.GetDirectoryName(dllPath)!;
+var assetDbPath = Path.Combine(managedDir, "Colossal.IO.AssetDatabase.dll");
+int assetDbPatched = 0;
+
+if (File.Exists(assetDbPath))
+{
+    Console.WriteLine($"\n==== Colossal.IO.AssetDatabase.dll ====\n");
+    var assetResolver = new DefaultAssemblyResolver();
+    assetResolver.AddSearchDirectory(managedDir);
+    var assetModule = ModuleDefinition.ReadModule(assetDbPath, new ReaderParameters
+    {
+        ReadingMode = ReadingMode.Immediate,
+        AssemblyResolver = assetResolver,
+        ReadSymbols = false
+    });
+
+    var fsd = assetModule.Types.FirstOrDefault(t => t.Name == "FileSystemDataSource");
+    if (fsd != null)
+    {
+        var popDir = fsd.Methods.FirstOrDefault(m => m.Name == "PopulateFromDirectory");
+        if (popDir != null)
+        {
+            var ail = popDir.Body.Instructions;
+            for (int i = 0; i < ail.Count - 5; i++)
+            {
+                if (ail[i].OpCode == OpCodes.Ldstr && (string)ail[i].Operand == ".priority")
+                {
+                    for (int j = i + 1; j < Math.Min(i + 10, ail.Count); j++)
+                    {
+                        if (ail[j].OpCode == OpCodes.Call && ail[j].Operand is MethodReference mr2
+                            && mr2.Name == "Exists" && mr2.DeclaringType.Name == "File")
+                        {
+                            var brInst = ail[j + 1];
+                            if (brInst.OpCode == OpCodes.Brfalse || brInst.OpCode == OpCodes.Brfalse_S)
+                            {
+                                var target = (Instruction)brInst.Operand;
+                                Console.WriteLine($"Fix 15: .priority File.Exists bypass in PopulateFromDirectory");
+                                Console.WriteLine($"  [{ail.IndexOf(ail[j - 1])}] {ail[j - 1].OpCode} -> nop");
+                                Console.WriteLine($"  [{ail.IndexOf(ail[j])}] call File::Exists -> nop");
+                                Console.WriteLine($"  [{ail.IndexOf(brInst)}] {brInst.OpCode} -> br -> [{ail.IndexOf(target)}]");
+
+                                if (!dryRun)
+                                {
+                                    ail[j - 1].OpCode = OpCodes.Nop;
+                                    ail[j - 1].Operand = null;
+                                    ail[j].OpCode = OpCodes.Nop;
+                                    ail[j].Operand = null;
+                                    brInst.OpCode = OpCodes.Br;
+                                    Console.WriteLine("  -> PATCHED");
+                                }
+                                else Console.WriteLine("  -> Would patch");
+                                assetDbPatched++;
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        else Console.WriteLine("  PopulateFromDirectory not found!");
+    }
+    else Console.WriteLine("  FileSystemDataSource not found!");
+
+    if (!dryRun && assetDbPatched > 0)
+    {
+        var tempPath = assetDbPath + ".tmp";
+        assetModule.Write(tempPath);
+        assetModule.Dispose();
+        File.Move(tempPath, assetDbPath, overwrite: true);
+        Console.WriteLine($"\nSaved patched Colossal.IO.AssetDatabase.dll ({assetDbPatched} fix)");
+    }
+    else
+    {
+        assetModule.Dispose();
+        if (dryRun) Console.WriteLine($"\nAssetDatabase: {assetDbPatched} fix(es) identified.");
+    }
+}
+else Console.WriteLine($"\nColossal.IO.AssetDatabase.dll not found in {managedDir} (skipping Fix 15)");
+
+Console.WriteLine($"\n==== Summary ====");
+Console.WriteLine($"PDX.SDK.dll: {totalPatched} fixes");
+Console.WriteLine($"Colossal.IO.AssetDatabase.dll: {assetDbPatched} fixes");
+Console.WriteLine($"Total: {totalPatched + assetDbPatched} fixes");
+if (dryRun) Console.WriteLine("Run with --patch to apply.");
 return 0;
