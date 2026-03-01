@@ -11,4 +11,8 @@
     <PackageReference Include="Mono.Cecil" Version="0.11.6" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="pdxpatcher/**" />
+  </ItemGroup>
+
 </Project>

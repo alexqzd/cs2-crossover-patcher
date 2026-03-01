@@ -1,57 +1,65 @@
-# Cities Skylines 2 — CrossOver Fix (macOS)
+# Cities Skylines 2 — CrossOver / Wine Fix (macOS)
 
-Fixes the crash that prevents Cities Skylines 2 from launching under CrossOver on macOS.
+Fixes crashes and **enables Paradox Mods** for Cities Skylines 2 running under CrossOver / Wine on macOS.
 
 Confirmed working on **v1.5.5f1 / CrossOver 26 / macOS 26 (Apple Silicon)**.
 
----
+### What this fixes
 
-## Quick Fix — Just copy a file
-
-**1. Find your game version**
-
-Open this file in a text editor and look for the line that starts with `Game version:`:
-```
-/Users/<you>/Library/Application Support/CrossOver/Bottles/Steam/drive_c/users/crossover/AppData/LocalLow/Colossal Order/Cities Skylines II/Player.log
-```
-
-**2. Download the patched DLL**
-
-Go to the [Releases](../../releases) page and download the zip for your game version. It contains a single file: `Colossal.IO.dll`.
-
-**3. Back up and replace**
-
-Navigate to:
-```
-<CrossOver Bottle>/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed/
-```
-
-- Rename the existing `Colossal.IO.dll` to `Colossal.IO.dll.bak`
-- Copy the downloaded `Colossal.IO.dll` into that folder
-
-**4. Two more things before launching**
-
-Remove invisible files macOS creates in the game folder (open Terminal and paste this, replacing the path with yours):
-```bash
-find "/Volumes/<Drive>/CrossOver Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II" -name '.DS_Store' -type f -delete
-```
-
-Create marker files in your save data folder:
-```bash
-find "/Volumes/<Drive>/CrossOver Bottles/Steam/drive_c/users/crossover/AppData/LocalLow/Colossal Order/Cities Skylines II" -type d -exec touch {}/.priority \;
-```
-
-**5. Launch the game** — it should work now.
-
-> **Note:** If Steam updates the game or you use "Verify Files", you'll need to redo step 3. Steps 4 are one-time only.
-
-> **Mods:** Paradox Mods in-game is broken for CrossOver users. You can still install mods manually from [paradoxmods.net](https://mods.paradoxplaza.com/games/cities_skylines_2).
+| Problem | Status |
+|---------|--------|
+| Game crashes on launch | ✅ Fixed |
+| **Paradox Mods — browse, subscribe, download & install from in-game** | ✅ Fixed |
+| Mods fail to load ("Failed to add Mod") | ✅ Fixed |
 
 ---
 
-## My version isn't listed — Patcher tool
+## Quick Fix — Download & copy 3 files
 
-If there's no pre-built DLL for your game version, you can patch your own in a few commands.
+**1. Download the patched DLLs**
+
+Go to the [Releases](../../releases) page and download the zip for your game version.
+
+> Don't know your game version? Check `Player.log` — look for the line starting with `Game version:`:
+> ```
+> ~/Library/Application Support/CrossOver/Bottles/Steam/drive_c/users/crossover/AppData/LocalLow/Colossal Order/Cities Skylines II/Player.log
+> ```
+
+**2. Back up your originals**
+
+Navigate to the game's `Managed` folder:
+```
+~/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed/
+```
+
+Rename these 3 files (add `.bak` to the end):
+- `Colossal.IO.dll` → `Colossal.IO.dll.bak`
+- `PDX.SDK.dll` → `PDX.SDK.dll.bak`
+- `Colossal.IO.AssetDatabase.dll` → `Colossal.IO.AssetDatabase.dll.bak`
+
+**3. Copy the patched files**
+
+Extract the zip and copy all 3 DLLs into the `Managed` folder.
+
+**4. Clean up macOS invisible files**
+
+Open Terminal and run (adjust the path to your drive):
+```bash
+find ~/Library/Application\ Support/CrossOver/Bottles/Steam/drive_c/Program\ Files\ \(x86\)/Steam/steamapps/common/Cities\ Skylines\ II -name '.DS_Store' -type f -delete
+```
+
+**5. Launch the game** — Paradox Mods should now work from the in-game mod browser. Browse, subscribe, and install mods just like on Windows.
+
+> **Note:** If Steam updates the game or you verify game files, you'll need to redo steps 2–3.
+
+---
+
+## Advanced — Patch it yourself
+
+If there's no pre-built DLL for your game version, you can patch your own.
+
+<details>
+<summary>Click to expand patcher instructions</summary>
 
 **Requirements:** [.NET SDK](https://dotnet.microsoft.com/download) (`brew install --cask dotnet-sdk`)
 
@@ -59,37 +67,72 @@ If there's no pre-built DLL for your game version, you can patch your own in a f
 # Clone this repo
 git clone https://github.com/alexqzd/cs2-crossover-patcher
 cd cs2-crossover-patcher
-
-# Dry run first — shows what it will change without touching anything
-dotnet run -- "/Volumes/<Drive>/CrossOver Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed/Colossal.IO.dll"
-
-# Apply the patch
-dotnet run -- "/Volumes/<Drive>/CrossOver Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed/Colossal.IO.dll" --patch
 ```
 
-The patcher matches by IL pattern (not hardcoded byte offsets), so it works across game versions.
+Set your Managed directory path (adjust the drive name):
+```bash
+MANAGED="$HOME/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed"
+```
+
+**Patch 1 — Colossal.IO.dll** (fixes launch crash):
+```bash
+cp "$MANAGED/Colossal.IO.dll" "$MANAGED/Colossal.IO.dll.bak"
+dotnet run -- "$MANAGED/Colossal.IO.dll"          # dry run
+dotnet run -- "$MANAGED/Colossal.IO.dll" --patch   # apply
+```
+
+**Patch 2 — PDX.SDK.dll + Colossal.IO.AssetDatabase.dll** (enables Paradox Mods):
+```bash
+cp "$MANAGED/PDX.SDK.dll" "$MANAGED/PDX.SDK.dll.bak"
+cp "$MANAGED/Colossal.IO.AssetDatabase.dll" "$MANAGED/Colossal.IO.AssetDatabase.dll.bak"
+dotnet run --project pdxpatcher -- "$MANAGED"          # dry run
+dotnet run --project pdxpatcher -- "$MANAGED" --patch   # apply
+```
+
+Clean up macOS artifacts:
+```bash
+find "$MANAGED/../../.." -name '.DS_Store' -type f -delete
+```
+
+The patchers match by IL instruction patterns (not byte offsets), so they should work across game versions.
+
+</details>
 
 ---
 
-## Technical details
+## How it works
 
-Wine returns unexpected error codes from the Win32 `FindNextFile` API. Inside `Colossal.IO.dll`, the `LongDirectory` class uses a custom filesystem iterator that checks this error code and throws an `IOException` for anything other than `ERROR_NO_MORE_FILES` (18). Under Wine, valid calls randomly return other codes, crashing the game at startup before the main menu.
+The patchers use [Mono.Cecil](https://github.com/jbevain/cecil) to apply IL-level binary patches to 3 game DLLs, fixing Wine/CrossOver compatibility bugs.
 
-The fix removes the error-check block in both iterator state machines (`EnumerateFileSystemIterator` and `EnumerateFileSystemIteratorRecursive`), so unexpected error codes are silently ignored and the iterator simply stops — which is the correct behavior.
+### Colossal.IO.dll — Launch crash fix
 
-Specifically, in each `MoveNext()` method, the following IL block is replaced with NOPs:
+Wine returns unexpected error codes from `FindNextFile`. The game throws an `IOException` for anything other than `ERROR_NO_MORE_FILES`, crashing at startup. The fix NOPs the error-check block.
 
-```
-call  Marshal::GetLastWin32Error()
-stloc errorCode
-ldloc errorCode
-ldc.i4.s 18                         // ERROR_NO_MORE_FILES
-beq.s [cleanup]                     // skip throw if normal end
-ldloc errorCode
-ldnull
-ldstr "path"
-call  Helper::GetExceptionFromWin32Error(...)
-throw                               // ← this is what crashes under Wine
-```
+Original research: [presidenzo on r/CitiesSkylines2](https://www.reddit.com/r/CitiesSkylines2/comments/1j06llw/cs2_macoswhisky_123f1/).
 
-Original research and fix: [presidenzo on r/CitiesSkylines2](https://www.reddit.com/r/CitiesSkylines2/comments/1j06llw/cs2_macoswhisky_123f1/).
+### PDX.SDK.dll + Colossal.IO.AssetDatabase.dll — Paradox Mods fix
+
+Wine's `GetFileAttributesW` lies — it reports files exist when they don't (if the parent directory exists). This breaks the entire mod download pipeline. The patcher applies 87 targeted IL fixes:
+
+<details>
+<summary>Full fix table (15 fixes across 2 DLLs)</summary>
+
+| # | DLL | Description |
+|---|-----|-------------|
+| 1 | PDX.SDK | NOP `IOException` throws after P/Invoke calls |
+| 2 | PDX.SDK | `PathExists` → always `false` in `CreateDirectory` |
+| 3 | PDX.SDK | Backslash → forward slash in path operations |
+| 4 | PDX.SDK | `PathExists` → always `false` in `CreateWriteStream` |
+| 5 | PDX.SDK | `PathExists` → always `false` in `CreateReadStream` |
+| 6 | PDX.SDK | `PathExists` → always `false` in `DeleteFile` |
+| 7 | PDX.SDK | Backslash → forward slash in `MoveFile` |
+| 8 | PDX.SDK | NOP `IOException` throws in `MoveFile` |
+| 9 | PDX.SDK | Bypass `PathExists` check in `DownloadFilesInManifest` |
+| 10 | PDX.SDK | NOP `CancellationToken.ThrowIfCancellationRequested` (Wine spurious cancellation) |
+| 11 | PDX.SDK | NOP `IsCancelledOperation` checks |
+| 12 | PDX.SDK | NOP `ThrowIfCancellationRequested` in download state machines |
+| 13 | PDX.SDK | Always create new file in `PerformDownload` |
+| 14 | PDX.SDK | `FileAlreadyDownloaded` → always returns `false` |
+| 15 | AssetDatabase | Skip `.priority` file check in `PopulateFromDirectory` |
+
+</details>
