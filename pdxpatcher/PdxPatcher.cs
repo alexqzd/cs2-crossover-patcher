@@ -289,20 +289,32 @@ foreach (var type in module.Types)
     {
         if (!method.HasBody) continue;
         var il = method.Body.Instructions;
-        for (int i = 1; i < il.Count; i++)
+        bool bodyReplaced = false;
+        for (int i = 1; i < il.Count && !bodyReplaced; i++)
         {
             if (il[i].OpCode != OpCodes.Call && il[i].OpCode != OpCodes.Callvirt) continue;
             var mr = il[i].Operand as MethodReference;
             if (mr == null || mr.Name != "get_IsCancellationRequested") continue;
 
             var typeName = method.DeclaringType.FullName;
+            var prev = il[i - 1];
             string nextInfo = (i + 1 < il.Count) ? $" + {il[i+1].OpCode}" : "";
-            Console.WriteLine($"  {typeName}::{method.Name}[{i}]{nextInfo}");
+            Console.WriteLine($"  {typeName}::{method.Name}[{i}]{nextInfo} prev={prev.OpCode}");
 
             if (!dryRun)
             {
+                // Wholesale-replace bool methods where prev is ret (null-check short-circuit path).
+                // NOPing the ret would corrupt the stack — replace the entire body instead.
+                if (prev.OpCode == OpCodes.Ret && method.ReturnType.MetadataType == MetadataType.Boolean)
+                {
+                    ReplaceWithReturnFalse(method);
+                    Console.WriteLine("  -> PATCHED (wholesale-replace bool method)");
+                    cancelPatched++;
+                    totalPatched++;
+                    bodyReplaced = true;
+                    break;
+                }
                 // NOP preceding instructions based on pattern
-                var prev = il[i - 1];
                 if (prev.OpCode == OpCodes.Ldflda)
                 {
                     // ldflda consumes an object ref from the stack
@@ -522,7 +534,8 @@ foreach (var type in module.Types)
     {
         if (!method.HasBody) continue;
         var il = method.Body.Instructions;
-        for (int i = 1; i < il.Count; i++)
+        bool bodyReplaced = false;
+        for (int i = 1; i < il.Count && !bodyReplaced; i++)
         {
             if (il[i].OpCode != OpCodes.Call && il[i].OpCode != OpCodes.Callvirt) continue;
             var mr = il[i].Operand as MethodReference;
@@ -534,9 +547,18 @@ foreach (var type in module.Types)
 
             if (!dryRun)
             {
+                var prev = il[i - 1];
+                if (prev.OpCode == OpCodes.Ret && method.ReturnType.MetadataType == MetadataType.Boolean)
+                {
+                    ReplaceWithReturnFalse(method);
+                    Console.WriteLine("  -> PATCHED (wholesale-replace bool method)");
+                    icoPatched++;
+                    totalPatched++;
+                    bodyReplaced = true;
+                    break;
+                }
                 // IsCancelledOperation is a static extension method taking 1 argument.
                 // The argument is loaded by 1-3 preceding instructions depending on pattern.
-                var prev = il[i - 1];
                 if (prev.OpCode == OpCodes.Ldfld && i >= 3 && il[i - 2].OpCode == OpCodes.Ldfld)
                 {
                     // ldarg.0 + ldfld + ldfld + call -> NOP 3
@@ -664,6 +686,154 @@ if (remoteRepo14 != null)
 }
 else Console.WriteLine("  RemoteRepository not found!");
 
+// ---- FIX 15: FileIO.GetLockToken — remove Win32 timer that fires in milliseconds under Wine ----
+// CancellationTokenSource(TimeSpan.FromSeconds(10)) uses a Win32 waitable timer which Wine fires
+// in milliseconds, cancelling all downloads before they begin.
+// Fix: ignore the timeout entirely — pass the caller's token directly through (ldarg.1; ret).
+Console.WriteLine("\n=== FileIO.GetLockToken (remove Win32 timer cancellation) ===");
+int fix15Patched = 0;
+if (fileIO != null)
+{
+    var getLockToken = fileIO.Methods.FirstOrDefault(m => m.Name == "GetLockToken");
+    if (getLockToken?.HasBody == true)
+    {
+        Console.WriteLine($"  Found GetLockToken ({getLockToken.Body.Instructions.Count} instructions)");
+        if (!dryRun)
+        {
+            getLockToken.Body.Instructions.Clear();
+            getLockToken.Body.ExceptionHandlers.Clear();
+            getLockToken.Body.Variables.Clear();
+            var ilp15 = getLockToken.Body.GetILProcessor();
+            ilp15.Append(ilp15.Create(OpCodes.Ldarg_1));
+            ilp15.Append(ilp15.Create(OpCodes.Ret));
+            Console.WriteLine("  -> PATCHED (ldarg.1; ret — pass-through)");
+        }
+        else Console.WriteLine("  -> Would replace with ldarg.1; ret");
+        fix15Patched++;
+        totalPatched++;
+    }
+    else Console.WriteLine("  GetLockToken not found!");
+}
+else Console.WriteLine("  FileIO type not found!");
+
+// ---- FIX 16: FileIO.<CreateFileStream> — dispose lock on IOException to prevent semaphore deadlock ----
+// Under Wine, PathExists returns true for non-existent files. CreateFileStream acquires a reader lock,
+// then FileNotFoundException is thrown. The IOException catch block exits via leave without calling
+// lockResult.Dispose(), leaving _readSemaphore at 0 and deadlocking all subsequent downloads.
+Console.WriteLine("\n=== FileIO.<CreateFileStream> (dispose lock on IOException) ===");
+int fix16Patched = 0;
+if (fileIO != null)
+{
+    var createFileSM = fileIO.NestedTypes.FirstOrDefault(t => t.Name.Contains("CreateFileStream"));
+    if (createFileSM != null)
+    {
+        var moveNext16 = createFileSM.Methods.FirstOrDefault(m => m.Name == "MoveNext");
+        if (moveNext16?.HasBody == true)
+        {
+            Console.WriteLine($"  Found {createFileSM.Name}::MoveNext ({moveNext16.Body.Instructions.Count} instructions)");
+            var lockVar = moveNext16.Body.Variables.FirstOrDefault(v => v.VariableType.Name == "AcquireLockResult");
+            Console.WriteLine(lockVar != null ? $"  Found AcquireLockResult local V_{lockVar.Index}" : "  AcquireLockResult local not found!");
+
+            if (lockVar != null)
+            {
+                var lockResultTypeDef = lockVar.VariableType.Resolve();
+                var disposeMethod = lockResultTypeDef?.Methods.FirstOrDefault(m => m.Name == "Dispose");
+                Console.WriteLine(disposeMethod != null ? "  Found AcquireLockResult.Dispose" : "  AcquireLockResult.Dispose not found!");
+
+                if (disposeMethod != null)
+                {
+                    var body16 = moveNext16.Body;
+                    var ioHandlers = body16.ExceptionHandlers
+                        .Where(h => h.HandlerType == ExceptionHandlerType.Catch)
+                        .ToList();
+                    Console.WriteLine($"  Found {ioHandlers.Count} catch block(s)");
+
+
+                    foreach (var handler in ioHandlers)
+                    {
+                        var il16 = body16.Instructions;
+                        bool hasCreateIo = false;
+                        int hStart = il16.IndexOf(handler.HandlerStart);
+                        int hEnd = il16.IndexOf(handler.HandlerEnd);
+                        for (int j = hStart; j < hEnd; j++)
+                        {
+                            if ((il16[j].Operand as MethodReference)?.Name == "CreateIoResultFromException")
+                            { hasCreateIo = true; break; }
+                        }
+                        if (!hasCreateIo) continue;
+
+                        Console.WriteLine("  Found IOException catch with CreateIoResultFromException");
+                        if (!dryRun)
+                        {
+                            var disposeRef = module.ImportReference(disposeMethod);
+                            var ilp16 = body16.GetILProcessor();
+                            // Iterate backwards so inserts don't shift later indices
+                            for (int j = hEnd - 1; j >= hStart; j--)
+                            {
+                                if (il16[j].OpCode != OpCodes.Leave && il16[j].OpCode != OpCodes.Leave_S) continue;
+                                var ldloca = ilp16.Create(OpCodes.Ldloca_S, lockVar);
+                                var callDispose = ilp16.Create(OpCodes.Call, disposeRef);
+                                ilp16.InsertBefore(il16[j], ldloca);
+                                ilp16.InsertBefore(il16[j], callDispose);
+                                Console.WriteLine($"  -> Inserted Dispose() before leave");
+                                fix16Patched++;
+                                totalPatched++;
+                            }
+                        }
+                        else
+                        {
+                            int leaveCount = 0;
+                            for (int j = hStart; j < hEnd; j++)
+                                if (il16[j].OpCode == OpCodes.Leave || il16[j].OpCode == OpCodes.Leave_S) leaveCount++;
+                            Console.WriteLine($"  -> Would insert Dispose() before {leaveCount} leave(s)");
+                            fix16Patched += leaveCount;
+                            totalPatched += leaveCount;
+                        }
+                    }
+                    if (fix16Patched == 0) Console.WriteLine("  No qualifying IOException catch blocks found!");
+                }
+            }
+        }
+        else Console.WriteLine("  CreateFileStream MoveNext not found!");
+    }
+    else Console.WriteLine("  CreateFileStream state machine not found!");
+}
+else Console.WriteLine("  FileIO type not found (fix 16)!");
+
+// ---- FIX 17: DiskIODefaultWindows ListFiles/ListDirectories/ListFilesRecursive — IOException wrap ----
+// On fresh installs Wine's GetFileAttributes lies about non-existent directories.
+// These methods throw IOException: "Success" when the dir doesn't exist.
+// Fix: wrap each method body in try-catch(IOException){return new List<string>()}.
+Console.WriteLine("\n=== DiskIODefaultWindows ListFiles/ListDirectories/ListFilesRecursive (IOException wrap) ===");
+int fix17Patched = 0;
+foreach (var listMethodName in new[] { "ListFiles", "ListDirectories", "ListFilesRecursive" })
+{
+    var listMethod = diskIO.Methods.FirstOrDefault(m => m.Name == listMethodName);
+    if (listMethod?.HasBody != true) { Console.WriteLine($"  {listMethodName}: not found!"); continue; }
+
+    // Reuse the List<T> constructor already referenced in the method body
+    MethodReference? listCtor17 = null;
+    foreach (var instr in listMethod.Body.Instructions)
+    {
+        if (instr.OpCode == OpCodes.Newobj && instr.Operand is MethodReference ctor17
+            && ctor17.DeclaringType.Name.StartsWith("List`1") && ctor17.Name == ".ctor")
+        { listCtor17 = ctor17; break; }
+    }
+
+    Console.WriteLine($"  {listMethodName} ({listMethod.Body.Instructions.Count} instr){(listCtor17 != null ? ", List ctor found" : ", List ctor NOT found — skipping")}");
+    if (listCtor17 == null) continue;
+
+    if (!dryRun)
+        WrapBodyReturningListInTryCatch(listMethod, listCtor17, ioExceptionRef);
+    else
+        Console.WriteLine($"  -> Would wrap in try-catch(IOException){{return new List()}}");
+    fix17Patched++;
+    totalPatched++;
+}
+Console.WriteLine(fix17Patched > 0
+    ? $"  Total: {(dryRun ? "Would patch" : "PATCHED")} {fix17Patched} list method(s)"
+    : "  No list methods patched!");
+
 Console.WriteLine();
 
 if (dryRun)
@@ -774,3 +944,64 @@ Console.WriteLine($"Colossal.IO.AssetDatabase.dll: {assetDbPatched} fixes");
 Console.WriteLine($"Total: {totalPatched + assetDbPatched} fixes");
 if (dryRun) Console.WriteLine("Run with --patch to apply.");
 return 0;
+
+// ---- Helper: wholesale-replace a bool-returning method with "return false" ----
+// Used when prev opcode is ret (null-check short-circuit) — NOPing ret corrupts the stack.
+void ReplaceWithReturnFalse(MethodDefinition method)
+{
+    method.Body.Instructions.Clear();
+    method.Body.ExceptionHandlers.Clear();
+    method.Body.Variables.Clear();
+    var ilp = method.Body.GetILProcessor();
+    ilp.Append(ilp.Create(OpCodes.Ldc_I4_0));
+    ilp.Append(ilp.Create(OpCodes.Ret));
+}
+
+// ---- Helper: wrap a list-returning method in try-catch(IOException){return new List()} ----
+// All ret instructions become stloc+leave; after the try block the catch returns an empty list.
+void WrapBodyReturningListInTryCatch(MethodDefinition method, MethodReference listCtor, TypeReference ioException)
+{
+    var body = method.Body;
+    var ilp = body.GetILProcessor();
+    var instructions = body.Instructions;
+
+    var resultVar = new VariableDefinition(method.ReturnType);
+    body.Variables.Add(resultVar);
+    body.InitLocals = true;
+
+    var afterTry = ilp.Create(OpCodes.Nop);
+
+    // Replace all ret with stloc + leave.s afterTry (iterate backwards to keep indices stable)
+    for (int i = instructions.Count - 1; i >= 0; i--)
+    {
+        if (instructions[i].OpCode != OpCodes.Ret) continue;
+        instructions[i].OpCode = OpCodes.Stloc;
+        instructions[i].Operand = resultVar;
+        ilp.InsertAfter(instructions[i], ilp.Create(OpCodes.Leave_S, afterTry));
+    }
+
+    // Catch block: pop exception, create empty list, stloc, leave
+    var catchPop  = ilp.Create(OpCodes.Pop);
+    var catchNew  = ilp.Create(OpCodes.Newobj, listCtor);
+    var catchStloc = ilp.Create(OpCodes.Stloc, resultVar);
+    var catchLeave = ilp.Create(OpCodes.Leave_S, afterTry);
+    ilp.Append(catchPop);
+    ilp.Append(catchNew);
+    ilp.Append(catchStloc);
+    ilp.Append(catchLeave);
+
+    // afterTry: ldloc + ret
+    ilp.Append(afterTry);
+    ilp.Append(ilp.Create(OpCodes.Ldloc, resultVar));
+    ilp.Append(ilp.Create(OpCodes.Ret));
+
+    body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+    {
+        TryStart     = instructions[0],
+        TryEnd       = catchPop,
+        HandlerStart = catchPop,
+        HandlerEnd   = afterTry,
+        CatchType    = ioException
+    });
+    Console.WriteLine($"  -> PATCHED (try-catch(IOException) wrap)");
+}
