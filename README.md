@@ -2,7 +2,7 @@
 
 Fixes crashes and **enables Paradox Mods** for Cities Skylines 2 running under CrossOver / Wine on macOS.
 
-Confirmed working on **v1.5.5f1 / CrossOver 26 / macOS 26 (Apple Silicon)**.
+Confirmed working on **v1.6.0f1** and **v1.5.5f1** / CrossOver 26 / macOS 26 (Apple Silicon).
 
 ### What this fixes
 
@@ -10,11 +10,12 @@ Confirmed working on **v1.5.5f1 / CrossOver 26 / macOS 26 (Apple Silicon)**.
 |---------|--------|
 | Game crashes on launch | ✅ Fixed |
 | **Paradox Mods — browse, subscribe, download & install from in-game** | ✅ Fixed |
+| Mod downloads stuck at 4% (lock deadlock under Wine) | ✅ Fixed |
 | Mods fail to load ("Failed to add Mod") | ✅ Fixed |
 
 ---
 
-## Quick Fix — Download & copy 3 files
+## Quick Fix — Download & copy the patched DLLs
 
 **1. Download the patched DLLs**
 
@@ -32,14 +33,16 @@ Navigate to the game's `Managed` folder:
 ~/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Cities Skylines II/Cities2_Data/Managed/
 ```
 
-Rename these 3 files (add `.bak` to the end):
-- `Colossal.IO.dll` → `Colossal.IO.dll.bak`
+Rename these files (add `.bak` to the end). The v1.6.0f1 zip contains 4 DLLs;
+older releases (v1.5.5f1) contain 3 — rename whichever ones are in your zip:
 - `PDX.SDK.dll` → `PDX.SDK.dll.bak`
+- `Colossal.IO.dll` → `Colossal.IO.dll.bak`
 - `Colossal.IO.AssetDatabase.dll` → `Colossal.IO.AssetDatabase.dll.bak`
+- `Colossal.PSI.Common.dll` → `Colossal.PSI.Common.dll.bak` *(v1.6.0f1+)*
 
 **3. Copy the patched files**
 
-Extract the zip and copy all 3 DLLs into the `Managed` folder.
+Extract the zip and copy all the DLLs into the `Managed` folder.
 
 **4. Clean up macOS invisible files**
 
