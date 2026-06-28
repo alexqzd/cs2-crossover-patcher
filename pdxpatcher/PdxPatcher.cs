@@ -64,6 +64,7 @@ foreach (var methodName in nopTargets)
 var tryCatchTargets = new[]
 {
     ("Delete",          "System.IO.File",      "Delete"),
+    ("DeleteFile",      "System.IO.File",      "Delete"),
     ("DeleteDirectory", "System.IO.Directory", "Delete"),
     ("CreateDirectory", "System.IO.Directory", "CreateDirectory"),
     ("Move",            "System.IO.Directory", "Move"),
@@ -767,15 +768,22 @@ if (fileIO != null)
                         {
                             var disposeRef = module.ImportReference(disposeMethod);
                             var ilp16 = body16.GetILProcessor();
-                            // Iterate backwards so inserts don't shift later indices
+                            // Iterate backwards so inserts don't shift later indices.
+                            // AcquireLockResult is a reference type — load the reference (ldloc.s)
+                            // and use callvirt, matching the SDK's own dispose pattern in this
+                            // same method (the FileNotFound path: ldloc.s V_5; callvirt Dispose).
+                            // IMPORTANT: capture the leave instruction in a local BEFORE inserting.
+                            // Re-evaluating il16[j] after the first InsertBefore would point at the
+                            // just-inserted instruction, reversing the order (call before ldloc).
                             for (int j = hEnd - 1; j >= hStart; j--)
                             {
                                 if (il16[j].OpCode != OpCodes.Leave && il16[j].OpCode != OpCodes.Leave_S) continue;
-                                var ldloca = ilp16.Create(OpCodes.Ldloca_S, lockVar);
-                                var callDispose = ilp16.Create(OpCodes.Call, disposeRef);
-                                ilp16.InsertBefore(il16[j], ldloca);
-                                ilp16.InsertBefore(il16[j], callDispose);
-                                Console.WriteLine($"  -> Inserted Dispose() before leave");
+                                var leaveInstr = il16[j];
+                                var ldloc = ilp16.Create(OpCodes.Ldloc_S, lockVar);
+                                var callDispose = ilp16.Create(OpCodes.Callvirt, disposeRef);
+                                ilp16.InsertBefore(leaveInstr, ldloc);
+                                ilp16.InsertBefore(leaveInstr, callDispose);
+                                Console.WriteLine($"  -> Inserted ldloc.s; callvirt Dispose() before leave");
                                 fix16Patched++;
                                 totalPatched++;
                             }
@@ -854,11 +862,88 @@ else
     module.Dispose();
 }
 
-// ---- FIX 15: Colossal.IO.AssetDatabase.dll .priority File.Exists bypass ----
+var managedDir = Path.GetDirectoryName(dllPath)!;
+
+// ---- Colossal.IO.dll: LongDirectory FindNextFile error check ----
+// Wine returns false from FindNextFile even on success, which triggers the error-check block
+// (GetLastWin32Error → GetExceptionFromWin32Error → throw) in LongDirectory state machines.
+// Fix: NOP that entire block in every LongDirectory nested-type MoveNext.
+var colossalIoPath = Path.Combine(managedDir, "Colossal.IO.dll");
+int colossalIoPatched = 0;
+
+if (File.Exists(colossalIoPath))
+{
+    Console.WriteLine($"\n==== Colossal.IO.dll ====\n");
+    var ioModule = ModuleDefinition.ReadModule(colossalIoPath, new ReaderParameters
+    {
+        ReadingMode = ReadingMode.Immediate,
+        AssemblyResolver = new DefaultAssemblyResolver(),
+        ReadSymbols = false
+    });
+
+    var longDirType = ioModule.Types.FirstOrDefault(t => t.Name == "LongDirectory");
+    if (longDirType != null)
+    {
+        foreach (var nestedType in longDirType.NestedTypes)
+        {
+            var moveNext = nestedType.Methods.FirstOrDefault(m => m.Name == "MoveNext");
+            if (moveNext == null) continue;
+            var instr = moveNext.Body.Instructions.ToList();
+            for (int i = 0; i < instr.Count; i++)
+            {
+                if (instr[i].OpCode != OpCodes.Throw) continue;
+                if (i < 1 || instr[i - 1].OpCode != OpCodes.Call) continue;
+                var callTarget = instr[i - 1].Operand as MethodReference;
+                if (callTarget == null || !callTarget.Name.Contains("GetExceptionFromWin32Error")) continue;
+
+                int blockStart = -1;
+                for (int j = i - 1; j >= Math.Max(0, i - 15); j--)
+                {
+                    if (instr[j].OpCode == OpCodes.Call)
+                    {
+                        var mr = instr[j].Operand as MethodReference;
+                        if (mr != null && mr.Name.Contains("GetLastWin32Error")) { blockStart = j; break; }
+                    }
+                }
+                if (blockStart == -1) continue;
+
+                Console.WriteLine($"IO Fix: {nestedType.Name}::MoveNext — NOP GetLastWin32Error..throw at [{blockStart}..{i}]");
+                if (!dryRun)
+                {
+                    for (int j = blockStart; j <= i; j++)
+                    { instr[j].OpCode = OpCodes.Nop; instr[j].Operand = null; }
+                    Console.WriteLine("  -> PATCHED");
+                }
+                else Console.WriteLine("  -> Would NOP");
+                colossalIoPatched++;
+            }
+        }
+    }
+    else Console.WriteLine("  LongDirectory type not found!");
+
+    if (!dryRun && colossalIoPatched > 0)
+    {
+        var bakPath = colossalIoPath + ".bak";
+        if (!File.Exists(bakPath)) File.Copy(colossalIoPath, bakPath);
+        var tmpPath = colossalIoPath + ".tmp";
+        ioModule.Write(tmpPath);
+        ioModule.Dispose();
+        File.Move(tmpPath, colossalIoPath, overwrite: true);
+        Console.WriteLine($"\nSaved patched Colossal.IO.dll ({colossalIoPatched} fixes)");
+    }
+    else
+    {
+        ioModule.Dispose();
+        if (dryRun) Console.WriteLine($"\nColossal.IO: {colossalIoPatched} fix(es) identified.");
+        else if (colossalIoPatched == 0) Console.WriteLine("  Colossal.IO.dll: already patched or pattern not found.");
+    }
+}
+else Console.WriteLine($"\nColossal.IO.dll not found in {managedDir} (skipping)");
+
+// ---- Colossal.IO.AssetDatabase.dll .priority File.Exists bypass ----
 // Wine's GetFileAttributesW returns TRUE for non-existent files when parent dir exists.
 // PopulateFromDirectory calls File.Exists(".priority") → true → File.ReadAllLines → FileNotFoundException
 // Fix: NOP the File.Exists check, unconditional branch to skip .priority reading entirely.
-var managedDir = Path.GetDirectoryName(dllPath)!;
 var assetDbPath = Path.Combine(managedDir, "Colossal.IO.AssetDatabase.dll");
 int assetDbPatched = 0;
 
@@ -881,6 +966,10 @@ if (File.Exists(assetDbPath))
         if (popDir != null)
         {
             var ail = popDir.Body.Instructions;
+
+            // AssetDB Fix A: .priority File.Exists bypass
+            // Wine's GetFileAttributesW returns TRUE for non-existent files when parent dir exists.
+            // PopulateFromDirectory: File.Exists(".priority") → true → ReadAllLines → FileNotFoundException
             for (int i = 0; i < ail.Count - 5; i++)
             {
                 if (ail[i].OpCode == OpCodes.Ldstr && (string)ail[i].Operand == ".priority")
@@ -894,7 +983,7 @@ if (File.Exists(assetDbPath))
                             if (brInst.OpCode == OpCodes.Brfalse || brInst.OpCode == OpCodes.Brfalse_S)
                             {
                                 var target = (Instruction)brInst.Operand;
-                                Console.WriteLine($"Fix 15: .priority File.Exists bypass in PopulateFromDirectory");
+                                Console.WriteLine($"AssetDB Fix A: .priority File.Exists bypass");
                                 Console.WriteLine($"  [{ail.IndexOf(ail[j - 1])}] {ail[j - 1].OpCode} -> nop");
                                 Console.WriteLine($"  [{ail.IndexOf(ail[j])}] call File::Exists -> nop");
                                 Console.WriteLine($"  [{ail.IndexOf(brInst)}] {brInst.OpCode} -> br -> [{ail.IndexOf(target)}]");
@@ -917,6 +1006,35 @@ if (File.Exists(assetDbPath))
                     break;
                 }
             }
+
+            // AssetDB Fix B: NOP ThrowIfCancellationRequested in PopulateFromDirectory
+            // Under Wine, CancellationToken appears spuriously cancelled (same root cause as FIX 7).
+            // This call aborts the file enumeration loop before gameui.uiHost is processed,
+            // causing the gameui AssetDatabase to never register → assetdb://gameui/index.html fails → black screen.
+            for (int i = 1; i < ail.Count; i++)
+            {
+                if (ail[i].OpCode == OpCodes.Call && ail[i].Operand is MethodReference mrCancel
+                    && mrCancel.Name == "ThrowIfCancellationRequested"
+                    && mrCancel.DeclaringType.Name == "CancellationToken")
+                {
+                    var loadInst = ail[i - 1];
+                    Console.WriteLine($"AssetDB Fix B: ThrowIfCancellationRequested NOP");
+                    Console.WriteLine($"  [{i - 1}] {loadInst.OpCode} -> nop");
+                    Console.WriteLine($"  [{i}] call CancellationToken::ThrowIfCancellationRequested -> nop");
+
+                    if (!dryRun)
+                    {
+                        loadInst.OpCode = OpCodes.Nop;
+                        loadInst.Operand = null;
+                        ail[i].OpCode = OpCodes.Nop;
+                        ail[i].Operand = null;
+                        Console.WriteLine("  -> PATCHED");
+                    }
+                    else Console.WriteLine("  -> Would patch");
+                    assetDbPatched++;
+                    break;
+                }
+            }
         }
         else Console.WriteLine("  PopulateFromDirectory not found!");
     }
@@ -936,12 +1054,202 @@ if (File.Exists(assetDbPath))
         if (dryRun) Console.WriteLine($"\nAssetDatabase: {assetDbPatched} fix(es) identified.");
     }
 }
-else Console.WriteLine($"\nColossal.IO.AssetDatabase.dll not found in {managedDir} (skipping Fix 15)");
+else Console.WriteLine($"\nColossal.IO.AssetDatabase.dll not found in {managedDir} (skipping AssetDB fixes)");
+
+// ---- PSI Fix: Colossal.PSI.Common.dll DlcHelper.GetDlcAttributes — skip CorruptedContentException throw ----
+// Wine's AES decryption fails with Bad PKCS7 padding on .ntl DLC attribute files.
+// DlcHelper.GetDlcAttributes has a catch(Exception) block that throws CorruptedContentException
+// when the failed DLC is named "Game" — this propagates as FATAL and kills the game before
+// AssetDatabase scanning even starts.
+// Fix: change brfalse.s to br.s in the "Game" check so ALL failures fall to the softer path
+// that logs an error and continues the loop (same path used for non-Game DLCs).
+var psiCommonPath = Path.Combine(managedDir, "Colossal.PSI.Common.dll");
+int psiPatched = 0;
+
+if (File.Exists(psiCommonPath))
+{
+    Console.WriteLine($"\n==== Colossal.PSI.Common.dll ====\n");
+    var psiResolver = new DefaultAssemblyResolver();
+    psiResolver.AddSearchDirectory(managedDir);
+    var psiModule = ModuleDefinition.ReadModule(psiCommonPath, new ReaderParameters
+    {
+        ReadingMode = ReadingMode.Immediate,
+        AssemblyResolver = psiResolver,
+        ReadSymbols = false
+    });
+
+    var dlcHelper = psiModule.Types.FirstOrDefault(t => t.Name == "DlcHelper");
+    if (dlcHelper != null)
+    {
+        var getDlcAttr = dlcHelper.Methods.FirstOrDefault(m => m.Name == "GetDlcAttributes");
+        if (getDlcAttr?.HasBody == true)
+        {
+            var pil = getDlcAttr.Body.Instructions;
+            for (int i = 0; i < pil.Count - 2; i++)
+            {
+                if (pil[i].OpCode != OpCodes.Ldstr || (string)pil[i].Operand != "Game") continue;
+                if (pil[i + 1].OpCode != OpCodes.Call) continue;
+                var mr = pil[i + 1].Operand as MethodReference;
+                if (mr?.Name != "op_Equality" || mr.DeclaringType.FullName != "System.String") continue;
+                var brInst = pil[i + 2];
+                if (brInst.OpCode != OpCodes.Brfalse && brInst.OpCode != OpCodes.Brfalse_S) continue;
+
+                Console.WriteLine($"PSI Fix: DlcHelper.GetDlcAttributes — skip CorruptedContentException throw for 'Game' DLC");
+                Console.WriteLine($"  [{i}] ldstr \"Game\"");
+                Console.WriteLine($"  [{i + 1}] call String::op_Equality");
+                Console.WriteLine($"  [{i + 2}] {brInst.OpCode} -> {(brInst.OpCode == OpCodes.Brfalse_S ? "br.s" : "br")} (always skip throw)");
+
+                if (!dryRun)
+                {
+                    brInst.OpCode = brInst.OpCode == OpCodes.Brfalse_S ? OpCodes.Br_S : OpCodes.Br;
+                    Console.WriteLine("  -> PATCHED");
+                }
+                else Console.WriteLine("  -> Would patch");
+                psiPatched++;
+                break;
+            }
+            if (psiPatched == 0) Console.WriteLine("  Pattern not found in GetDlcAttributes!");
+        }
+        else Console.WriteLine("  GetDlcAttributes not found!");
+    }
+    else Console.WriteLine("  DlcHelper not found!");
+
+    // HashHelper Fix: DISABLED — modifying ComputeHash via Mono.Cecil corrupts branch offsets
+    // after multiple write cycles. The PSI Fix (brfalse→br) is sufficient to prevent crashes;
+    // .DS_Store files must be deleted manually before launching (see install instructions).
+#if HASHHELPER_FIX
+    // HashHelper Fix: ComputeHash — skip hidden files (starting with '.') like .DS_Store
+    // macOS creates .DS_Store files in Content/Game/ directories which Wine exposes.
+    // ComputeHash enumerates all files (excluding only .ntl) and hashes their paths + contents.
+    // These extra files change the xxHash3 key → wrong AES key → DecryptFile fails → Game DLC missing.
+    // Fix: after the existing .ntl skip, also skip any file whose name starts with '.'.
+    // Uses Path.GetFileName(relPath).StartsWith(".") — safe for empty strings and all path depths.
+    var hashHelper = psiModule.Types.FirstOrDefault(t => t.Name == "HashHelper");
+    if (hashHelper != null)
+    {
+        var computeHash = hashHelper.Methods.FirstOrDefault(m => m.Name == "ComputeHash");
+        if (computeHash?.HasBody == true)
+        {
+            var chil = computeHash.Body.Instructions;
+            bool chPatched = false;
+            // Pattern: ldloc.s <relPath> + call Path.GetExtension + <ldarg> + call String.op_Equality + brtrue[.s] <continue>
+            for (int i = 3; i < chil.Count - 1; i++)
+            {
+                if (chil[i].OpCode != OpCodes.Brtrue_S && chil[i].OpCode != OpCodes.Brtrue) continue;
+                var eqMr = chil[i - 1].Operand as MethodReference;
+                if (eqMr?.Name != "op_Equality" || eqMr.DeclaringType.FullName != "System.String") continue;
+                var extMr = chil[i - 3].Operand as MethodReference;
+                if (extMr?.Name != "GetExtension") continue;
+                if (chil[i - 4].OpCode != OpCodes.Ldloc_S && chil[i - 4].OpCode != OpCodes.Ldloc) continue;
+                var relPathVar = chil[i - 4].Operand as VariableDefinition;
+                if (relPathVar == null) continue;
+
+                var continueTarget = (Instruction)chil[i].Operand;
+
+                // Check if the correct fix (StartsWith) is already applied → skip
+                bool alreadyCorrect = i + 5 < chil.Count
+                    && (chil[i + 1].OpCode == OpCodes.Ldloc_S || chil[i + 1].OpCode == OpCodes.Ldloc)
+                    && (chil[i + 2].Operand as MethodReference)?.Name == "GetFileName"
+                    && chil[i + 3].OpCode == OpCodes.Ldstr && (string?)chil[i + 3].Operand == "."
+                    && (chil[i + 4].Operand as MethodReference)?.Name == "StartsWith"
+                    && (chil[i + 5].OpCode == OpCodes.Brtrue || chil[i + 5].OpCode == OpCodes.Brtrue_S);
+
+                if (alreadyCorrect)
+                {
+                    Console.WriteLine("HashHelper Fix: already correctly applied (StartsWith), skipping.");
+                    chPatched = true;
+                    break;
+                }
+
+                // Check if the old broken fix (get_Chars) is present → remove it first
+                bool hasBrokenFix = i + 7 < chil.Count
+                    && (chil[i + 1].OpCode == OpCodes.Ldloc_S || chil[i + 1].OpCode == OpCodes.Ldloc)
+                    && (chil[i + 2].Operand as MethodReference)?.Name == "GetFileName"
+                    && chil[i + 3].OpCode == OpCodes.Ldc_I4_0
+                    && chil[i + 4].OpCode == OpCodes.Callvirt
+                    && (chil[i + 4].Operand as MethodReference)?.Name == "get_Chars";
+
+                Console.WriteLine($"HashHelper Fix: ComputeHash — skip hidden files (name starts with '.')");
+                if (hasBrokenFix)
+                    Console.WriteLine("  Detected old broken fix (get_Chars) — will remove and replace with StartsWith");
+                Console.WriteLine($"  Insert after [{i}] brtrue: Path.GetFileName(relPath).StartsWith(\".\") → skip");
+
+                if (!dryRun)
+                {
+                    var ilp = computeHash.Body.GetILProcessor();
+
+                    // Remove old broken fix if present (7 instructions: ldloc + GetFileName + ldc.i4.0 + callvirt + ldc.i4.s + ceq + brtrue)
+                    if (hasBrokenFix)
+                    {
+                        for (int r = 0; r < 7; r++)
+                            ilp.Remove(chil[i + 1]); // after each removal, [i+1] shifts to the next
+                        Console.WriteLine("  -> Removed 7 broken instructions");
+                    }
+
+                    // Build Path.GetFileName reference
+                    MethodReference? getFileNameRef = chil
+                        .Select(x => x.Operand as MethodReference)
+                        .FirstOrDefault(m => m?.Name == "GetFileName" && m.DeclaringType.Name == "Path");
+                    if (getFileNameRef == null)
+                    {
+                        var mscorlibRef2 = psiModule.AssemblyReferences.First(a => a.Name == "mscorlib");
+                        var pathType = new TypeReference("System.IO", "Path", psiModule, mscorlibRef2);
+                        var mr = new MethodReference("GetFileName", psiModule.TypeSystem.String, pathType);
+                        mr.Parameters.Add(new ParameterDefinition(psiModule.TypeSystem.String));
+                        getFileNameRef = psiModule.ImportReference(mr);
+                    }
+
+                    // Build String.StartsWith(string) reference
+                    var mscorlibRef3 = psiModule.AssemblyReferences.First(a => a.Name == "mscorlib");
+                    var strType2 = new TypeReference("System", "String", psiModule, mscorlibRef3);
+                    var startsWithMr = new MethodReference("StartsWith", psiModule.TypeSystem.Boolean, strType2) { HasThis = true };
+                    startsWithMr.Parameters.Add(new ParameterDefinition(psiModule.TypeSystem.String));
+                    var startsWithRef = psiModule.ImportReference(startsWithMr);
+
+                    // Insert: ldloc relPath → call GetFileName → ldstr "." → callvirt StartsWith → brtrue skip
+                    var insertBefore = chil[i + 1];
+                    var newBrtrue = ilp.Create(OpCodes.Brtrue, continueTarget);
+                    ilp.InsertBefore(insertBefore, ilp.Create(OpCodes.Ldloc_S, relPathVar));
+                    ilp.InsertBefore(insertBefore, ilp.Create(OpCodes.Call, getFileNameRef));
+                    ilp.InsertBefore(insertBefore, ilp.Create(OpCodes.Ldstr, "."));
+                    ilp.InsertBefore(insertBefore, ilp.Create(OpCodes.Callvirt, startsWithRef));
+                    ilp.InsertBefore(insertBefore, newBrtrue);
+                    Console.WriteLine("  -> PATCHED (StartsWith)");
+                }
+                else Console.WriteLine("  -> Would insert hidden-file skip (StartsWith)");
+                psiPatched++;
+                chPatched = true;
+                break;
+            }
+            if (!chPatched) Console.WriteLine("  HashHelper Fix: pattern not found in ComputeHash!");
+        }
+        else Console.WriteLine("  HashHelper.ComputeHash not found!");
+    }
+    else Console.WriteLine("  HashHelper type not found!");
+#endif // HASHHELPER_FIX
+
+    if (!dryRun && psiPatched > 0)
+    {
+        var tempPath = psiCommonPath + ".tmp";
+        psiModule.Write(tempPath);
+        psiModule.Dispose();
+        File.Move(tempPath, psiCommonPath, overwrite: true);
+        Console.WriteLine($"\nSaved patched Colossal.PSI.Common.dll ({psiPatched} fix)");
+    }
+    else
+    {
+        psiModule.Dispose();
+        if (dryRun) Console.WriteLine($"\nPSI Common: {psiPatched} fix(es) identified.");
+    }
+}
+else Console.WriteLine($"\nColossal.PSI.Common.dll not found in {managedDir} (skipping PSI fix)");
 
 Console.WriteLine($"\n==== Summary ====");
 Console.WriteLine($"PDX.SDK.dll: {totalPatched} fixes");
+Console.WriteLine($"Colossal.IO.dll: {colossalIoPatched} fixes");
 Console.WriteLine($"Colossal.IO.AssetDatabase.dll: {assetDbPatched} fixes");
-Console.WriteLine($"Total: {totalPatched + assetDbPatched} fixes");
+Console.WriteLine($"Colossal.PSI.Common.dll: {psiPatched} fixes");
+Console.WriteLine($"Total: {totalPatched + colossalIoPatched + assetDbPatched + psiPatched} fixes");
 if (dryRun) Console.WriteLine("Run with --patch to apply.");
 return 0;
 
