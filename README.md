@@ -1,5 +1,11 @@
 # Cities Skylines 2 — CrossOver / Wine Fix (macOS)
 
+> [!WARNING]
+> This repo is no longer actively maintained. For a more complete, actively
+> maintained patcher (more fixes, guided installer, automatic bottle detection), use
+> **[alien-agent/cs2-macos-patcher](https://github.com/alien-agent/cs2-macos-patcher)**
+> instead — it builds on the fixes from this repo and adds several more.
+
 Fixes crashes and **enables Paradox Mods** for Cities Skylines 2 running under CrossOver / Wine on macOS.
 
 Confirmed working on **v1.6.0f1** and **v1.5.5f1** / CrossOver 26 / macOS 26 (Apple Silicon).
